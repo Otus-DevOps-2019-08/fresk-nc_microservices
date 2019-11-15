@@ -286,3 +286,184 @@ docker run --name reddit -d -p 9292:9292 fresk/otus-reddit:1.0
 ```
 
 Проверил, что приложение открывается локально `http://127.0.0.1:9292`.
+
+## Homework 13. Docker-образы. Микросервисы.
+
+[Рекомендуемые правила по написанию докерфайлов](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/)
+
+Подключился к ранее созданному докер хосту
+```
+docker-machine ls
+
+NAME          ACTIVE   DRIVER   STATE     URL                        SWARM   DOCKER     ERRORS
+docker-host   *        google   Running   tcp://35.240.35.125:2376           v19.03.4
+
+eval $(docker-machine env docker-host)
+```
+
+Скачал проект с архивом и распаковал его в папку src.
+
+Создал post-py/Dockerfile:
+```
+FROM python:3.6.0-alpine
+
+ENV POST_DATABASE_HOST post_db
+ENV POST_DATABASE posts
+
+WORKDIR /app
+COPY . /app
+
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev \
+    && pip install -r /app/requirements.txt \
+    && apk del --virtual .build-deps gcc musl-dev
+
+ENTRYPOINT ["python3", "post_app.py"]
+```
+
+Создал comment/Dockerfile:
+```
+FROM ruby:2.2
+
+ENV APP_HOME /app
+ENV COMMENT_DATABASE_HOST comment_db
+ENV COMMENT_DATABASE comments
+
+RUN apt-get update -qq && apt-get install -y build-essential
+
+RUN mkdir $APP_HOME
+WORKDIR $APP_HOME
+
+COPY Gemfile* $APP_HOME/
+RUN bundle install
+COPY . $APP_HOME
+
+CMD ["puma"]
+```
+
+Создал ui/Dockerfile
+```
+FROM ruby:2.2
+
+ENV POST_SERVICE_HOST post
+ENV POST_SERVICE_PORT 5000
+ENV COMMENT_SERVICE_HOST comment
+ENV COMMENT_SERVICE_PORT 9292
+ENV APP_HOME /app
+
+RUN apt-get update -qq && apt-get install -y build-essential
+
+RUN mkdir $APP_HOME
+WORKDIR $APP_HOME
+
+COPY Gemfile* $APP_HOME/
+RUN bundle install
+COPY . $APP_HOME
+
+CMD ["puma"]
+```
+
+Скачал последний образ MongoDB:
+```
+docker pull mongo:latest
+```
+
+Собрал образы:
+```
+cd src
+docker build -t fresk/post:1.0 ./post-py
+docker build -t fresk/comment:1.0 ./comment
+docker build -t fresk/ui:1.0 ./ui
+```
+
+Создал сеть:
+```
+docker network create reddit
+```
+
+Запустил контейнеры:
+```
+docker run -d --network=reddit --network-alias=post_db --network-alias=comment_db mongo:latest
+docker run -d --network=reddit --network-alias=post fresk/post:1.0
+docker run -d --network=reddit --network-alias=comment fresk/comment:1.0
+docker run -d --network=reddit -p 9292:9292 fresk/ui:1.0
+```
+
+Образы очень много весят:
+```
+docker images
+
+REPOSITORY          TAG                 IMAGE ID            CREATED             SIZE
+fresk/ui            1.0                 84278b545bd2        6 minutes ago       783MB
+fresk/comment       1.0                 0df9e19a3a17        7 minutes ago       780MB
+fresk/post          1.0                 e560a7bfbc7c        10 minutes ago      109MB
+```
+
+Улучшил докер-образ для ui:
+```
+FROM ubuntu:16.04
+
+ENV APP_HOME /app
+ENV POST_SERVICE_HOST post
+ENV POST_SERVICE_PORT 5000
+ENV COMMENT_SERVICE_HOST comment
+ENV COMMENT_SERVICE_PORT 9292
+
+RUN apt-get update \
+    && apt-get install -y ruby-full ruby-dev build-essential \
+    && gem install bundler --no-ri --no-rdoc
+
+RUN mkdir $APP_HOME
+WORKDIR $APP_HOME
+
+COPY Gemfile* $APP_HOME/
+RUN bundle install
+COPY . $APP_HOME
+
+CMD ["puma"]
+```
+
+Пересобрал
+```
+docker build -t fresk/ui:2.0 ./ui
+```
+
+Размер уменьшился:
+```
+docker images
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+fresk/ui            2.0                 61b9a4fdb3c9        Less than a second ago   459MB
+```
+
+Выключил и запустил контейнеры:
+```
+docker kill $(docker ps -q)
+docker run -d --network=reddit --network-alias=post_db --network-alias=comment_db mongo:latest
+docker run -d --network=reddit --network-alias=post fresk/post:1.0
+docker run -d --network=reddit --network-alias=comment fresk/comment:1.0
+docker run -d --network=reddit -p 9292:9292 fresk/ui:2.0
+```
+
+Созданные посты не сохраняются после перезапуска.
+
+Создал docker volume:
+```
+docker volume create reddit_db
+```
+
+Выключил и запустил контейнеры:
+```
+docker kill $(docker ps -q)
+docker run -d --network=reddit --network-alias=post_db --network-alias=comment_db -v reddit_db:/data/db mongo:latest
+docker run -d --network=reddit --network-alias=post fresk/post:1.0
+docker run -d --network=reddit --network-alias=comment fresk/comment:1.0
+docker run -d --network=reddit -p 9292:9292 fresk/ui:2.0
+```
+
+> Подключил volume для mongodb `-v reddit_db:/data/db`
+
+Теперь посты остаются после перезапуска.
+
+Переключился обратно на локальный докер:
+```
+eval $(docker-machine env --unset)
+```
