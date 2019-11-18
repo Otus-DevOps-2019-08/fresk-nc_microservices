@@ -467,3 +467,406 @@ docker run -d --network=reddit -p 9292:9292 fresk/ui:2.0
 ```
 eval $(docker-machine env --unset)
 ```
+
+## Homework 14. Docker-образы. Микросервисы.
+
+Подключился к ранее созданному докер хосту
+
+```
+docker-machine ls
+
+NAME          ACTIVE   DRIVER   STATE     URL                        SWARM   DOCKER     ERRORS
+docker-host   -        google   Running   tcp://35.240.35.125:2376           v19.03.4
+
+eval $(docker-machine env docker-host)
+```
+
+### Работа с сетью
+
+#### None network driver
+
+```
+docker run -ti --rm --network none joffotron/docker-net-tools -c ifconfig
+
+Status: Downloaded newer image for joffotron/docker-net-tools:latest
+lo        Link encap:Local Loopback
+          inet addr:127.0.0.1  Mask:255.0.0.0
+          UP LOOPBACK RUNNING  MTU:65536  Metric:1
+          RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:1000
+          RX bytes:0 (0.0 B)  TX bytes:0 (0.0 B)
+```
+
+Видно, что существует один сетевой интерфейс - Loopback.
+Сетевой стек самого контейнера работает (ping localhost),
+но без возможности контактировать с внешним миром.
+Подходит для тестирования.
+
+#### Host network driver
+
+```
+docker run -ti --rm --network host joffotron/docker-net-tools -c ifconfig
+
+br-879b5e5dba3c Link encap:Ethernet  HWaddr 02:42:81:4E:1E:D2
+          inet addr:172.18.0.1  Bcast:172.18.255.255  Mask:255.255.0.0
+          inet6 addr: fe80::42:81ff:fe4e:1ed2%32555/64 Scope:Link
+          UP BROADCAST MULTICAST  MTU:1500  Metric:1
+          RX packets:36 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:47 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:0
+          RX bytes:5459 (5.3 KiB)  TX bytes:5915 (5.7 KiB)
+
+docker0   Link encap:Ethernet  HWaddr 02:42:06:79:4F:15
+          inet addr:172.17.0.1  Bcast:172.17.255.255  Mask:255.255.0.0
+          inet6 addr: fe80::42:6ff:fe79:4f15%32555/64 Scope:Link
+          UP BROADCAST MULTICAST  MTU:1500  Metric:1
+          RX packets:22537 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:25113 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:0
+          RX bytes:1635056 (1.5 MiB)  TX bytes:385744527 (367.8 MiB)
+
+ens4      Link encap:Ethernet  HWaddr 42:01:0A:84:00:02
+          inet addr:10.132.0.2  Bcast:10.132.0.2  Mask:255.255.255.255
+          inet6 addr: fe80::4001:aff:fe84:2%32555/64 Scope:Link
+          UP BROADCAST RUNNING MULTICAST  MTU:1460  Metric:1
+          RX packets:412597 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:371704 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:1000
+          RX bytes:1131373498 (1.0 GiB)  TX bytes:276893760 (264.0 MiB)
+
+lo        Link encap:Local Loopback
+          inet addr:127.0.0.1  Mask:255.0.0.0
+          inet6 addr: ::1%32555/128 Scope:Host
+          UP LOOPBACK RUNNING  MTU:65536  Metric:1
+          RX packets:1428698 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:1428698 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:1000
+          RX bytes:193767841 (184.7 MiB)  TX bytes:193767841 (184.7 MiB)
+```
+
+Соответствует выводу команды `docker-machine ssh docker-host ifconfig`
+
+Выполнил на докер хосте, чтобы видеть список namespace:
+```
+docker-machine ssh docker-host sudo ln -s /var/run/docker/netns /var/run/netns
+docker-machine ssh docker-host sudo ip netns
+
+default
+```
+
+#### Bridge network driver
+
+Создал bridge-сеть:
+```
+docker network create reddit --driver bridge 
+```
+
+> флаг --driver указывать не обязательно, т.к. по-умолчанию используется bridge
+
+Запустил проект:
+```
+docker run -d --network=reddit mongo:latest
+docker run -d --network=reddit fresk/post:1.0
+docker run -d --network=reddit fresk/comment:1.0
+docker run -d --network=reddit -p 9292:9292 fresk/ui:1.0
+```
+
+При открытие приложения в браузере получил ошибку
+```
+Can't show blog posts, some problems with the post service. Refresh?
+```
+
+Сервисы ссылаются друг на друга по dns именам, прописанным в ENV-переменных (см Dockerfile).
+В текущей инсталляции встроенный DNS docker не знает ничего об этих
+именах.
+
+Решением проблемы будет присвоение контейнерам имен или
+сетевых алиасов при старте:
+```
+--name <name> (можно задать только 1 имя)
+--network-alias <alias-name> (можно задать множество алиасов)
+```
+
+Остановил старые контейнеры и запустил новые:
+```
+docker kill $(docker ps -q)
+docker run -d --network=reddit --network-alias=post_db --network-alias=comment_db mongo:latest
+docker run -d --network=reddit --network-alias=post fresk/post:1.0
+docker run -d --network=reddit --network-alias=comment  fresk/comment:1.0
+docker run -d --network=reddit -p 9292:9292 fresk/ui:1.0
+```
+
+Теперь все хорошо.
+
+Попробуем запустить проект в двух bridge сетях, чтобы ui не имел доступа к db.
+
+Остановил контейнеры:
+```
+docker kill $(docker ps -q) 
+```
+
+Создал две сети:
+```
+docker network create back_net --subnet=10.0.2.0/24
+docker network create front_net --subnet=10.0.1.0/24
+```
+
+Запустил контейнеры:
+```
+docker run -d --network=front_net -p 9292:9292 --name ui  fresk/ui:1.0
+docker run -d --network=back_net --name comment fresk/comment:1.0
+docker run -d --network=back_net --name post fresk/post:1.0
+docker run -d --network=back_net --name mongo_db --network-alias=post_db --network-alias=comment_db mongo:latest
+```
+
+При открытие приложения в браузере получил ошибку
+```
+Can't show blog posts, some problems with the post service. Refresh?
+```
+
+Docker при инициализации контейнера может подключить к нему только 1
+сеть.
+При этом контейнеры из соседних сетей не будут доступны как в DNS, так
+и для взаимодействия по сети.
+
+Поэтому нужно поместить контейнеры post и comment в обе сети.
+
+Подключил контейнеры ко второй сети:
+```
+docker network connect front_net post
+docker network connect front_net comment 
+```
+
+Теперь все хорошо.
+
+Посмотрим, как выглядит сетевой стек Linux в текущий момент.
+
+Зашел на докер-хост и установил `bridge-utils`:
+```
+docker-machine ssh docker-host
+sudo apt-get update && sudo apt-get install bridge-utils
+```
+
+Выполнил
+```
+sudo docker network ls
+
+NETWORK ID          NAME                DRIVER              SCOPE
+3ad79515d36b        back_net            bridge              local
+400bf450909a        bridge              bridge              local
+a908dca911ec        front_net           bridge              local
+714a9e81fee3        host                host                local
+b9129fe3ebc1        none                null                local
+879b5e5dba3c        reddit              bridge              local
+```
+
+Выполнил
+```
+ifconfig | grep br
+
+br-3ad79515d36b Link encap:Ethernet  HWaddr 02:42:82:86:79:58
+br-879b5e5dba3c Link encap:Ethernet  HWaddr 02:42:81:4e:1e:d2
+br-a908dca911ec Link encap:Ethernet  HWaddr 02:42:d5:3c:7e:b8
+```
+
+Выполнил для первого bridge
+```
+brctl show br-3ad79515d36b
+
+bridge name	        bridge id		    STP enabled	    interfaces
+br-3ad79515d36b		8000.024282867958	no		        veth4c25bc5
+							                            veth5e2abdd
+							                            veth79dfb6d
+```
+
+Смотрим на iptables
+```
+sudo iptables -nL -t nat
+```
+
+Нас интересует цепочка `POSTROUTING`
+```
+Chain POSTROUTING (policy ACCEPT)
+target     prot opt source               destination
+MASQUERADE  all  --  10.0.1.0/24          0.0.0.0/0
+MASQUERADE  all  --  10.0.2.0/24          0.0.0.0/0
+MASQUERADE  all  --  172.18.0.0/16        0.0.0.0/0
+MASQUERADE  all  --  172.17.0.0/16        0.0.0.0/0
+MASQUERADE  tcp  --  10.0.1.2             10.0.1.2             tcp dpt:9292
+```
+
+В ходе работы была необходимость публикации порта контейнера
+UI (9292) для доступа к нему снаружи.
+Посмотрим, что Docker при этом сделал в iptables:
+```
+Chain DOCKER (2 references)
+target     prot opt source               destination
+RETURN     all  --  0.0.0.0/0            0.0.0.0/0
+RETURN     all  --  0.0.0.0/0            0.0.0.0/0
+RETURN     all  --  0.0.0.0/0            0.0.0.0/0
+RETURN     all  --  0.0.0.0/0            0.0.0.0/0
+DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:9292 to:10.0.1.2:9292
+```
+
+Строчка `DNAT`.
+
+Выполнил
+```
+ps ax | grep docker-proxy
+
+10392 ?        Sl     0:00 /usr/bin/docker-proxy -proto tcp -host-ip 0.0.0.0 -host-port 9292 -container-ip 10.0.1.2 -container-port 9292
+```
+
+Видно, что запущен docker-proxy.
+
+### Docker-compose
+
+Проблемы:
+* Одно приложение состоит из множества контейнеров/сервисов
+* Один контейнер зависит от другого
+* Порядок запуска имеет значение
+* docker build/run/create … (долго и много)
+
+docker-compose - отдельная утилита, позволяет декларативно описывать докер-инфраструктуры в yaml и
+управлять многоконтейнерными приложениями.
+
+Создал `src/docker-compose.yml`:
+```
+version: '3.3'
+services:
+  post_db:
+    image: mongo:3.2
+    volumes:
+      - post_db:/data/db
+    networks:
+      - reddit
+  ui:
+    build: ./ui
+    image: ${USERNAME}/ui:1.0
+    ports:
+      - 9292:9292/tcp
+    networks:
+      - reddit
+  post:
+    build: ./post-py
+    image: ${USERNAME}/post:1.0
+    networks:
+      - reddit
+  comment:
+    build: ./comment
+    image: ${USERNAME}/comment:1.0
+    networks:
+      - reddit
+
+volumes:
+  post_db:
+
+networks:
+  reddit:
+```
+
+Остановил контейнеры:
+```
+docker kill $(docker ps -q)
+```
+
+Экспортировал переменную `USERNAME`:
+```
+export USERNAME=fresk
+```
+
+Запустил контейнеры:
+```
+docker-compose up -d 
+```
+
+Смотрим список контейнеров:
+```
+docker-compose ps
+
+    Name                  Command             State           Ports
+----------------------------------------------------------------------------
+src_comment_1   puma                          Up
+src_post_1      python3 post_app.py           Up
+src_post_db_1   docker-entrypoint.sh mongod   Up      27017/tcp
+src_ui_1        puma                          Up      0.0.0.0:9292->9292/tcp
+```
+
+Добавил в docker-compose.yml несколько сетей, параметризовал версии сервисов и порт:
+```
+version: '3.3'
+services:
+  post_db:
+    image: mongo:${VERSION_MONGODB}
+    volumes:
+      - post_db:/data/db
+    networks:
+      back_net:
+        aliases:
+          - post_db
+          - comment_db
+  ui:
+    build: ./ui
+    image: ${USERNAME}/ui:${VERSION_UI}
+    ports:
+      - ${UI_PORT}:${UI_PORT}/tcp
+    networks:
+      - front_net
+  post:
+    build: ./post-py
+    image: ${USERNAME}/post:${VERSION_POST}
+    networks:
+      - back_net
+      - front_net
+  comment:
+    build: ./comment
+    image: ${USERNAME}/comment:${VERSION_COMMENT}
+    networks:
+      - back_net
+      - front_net
+
+volumes:
+  post_db:
+
+networks:
+  front_net:
+  back_net:
+```
+
+Переменные окружения положил в `.env`.
+
+Погасил контейнеры:
+```
+docker-compose down
+```
+
+Все контейнеры имеют префикс `src_`, он берется из названия папки в которой лежит
+`docker-compose.yml`.
+
+Есть два способа изменить префикс:
+1. Задать перменную окружения `COMPOSE_PROJECT_NAME` - `COMPOSE_PROJECT_NAME=reddit`
+2. При запуске указать флаг `-p` - `docker-compose -p reddit up -d`
+
+### Задание со *
+
+Создал docker-compose.override.yml, который позволяет изменять код каждого
+из приложений без пересборки образов, и запускать puma в дебаг режиме с двумя воркерами.
+```
+version: '3.3'
+services:
+  ui:
+    volumes:
+      - ./ui:/app
+    command: ["puma", "--debug", "--workers", "2"]
+  post:
+    volumes:
+      - ./post-py:/app
+  comment:
+    volumes:
+      - ./comment:/app
+    command: ["puma", "--debug", "--workers", "2"]
+```
+
+### Полезные источники
+* [https://docs.docker.com/compose/compose-file/](https://docs.docker.com/compose/compose-file/)
