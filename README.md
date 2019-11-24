@@ -870,3 +870,333 @@ services:
 
 ### Полезные источники
 * [https://docs.docker.com/compose/compose-file/](https://docs.docker.com/compose/compose-file/)
+
+## Homework 15. Устройство Gitlab CI. Построение процесса непрерывной поставки
+
+Создал новую виртуалку в GCP.
+Подключился по ssh и поставил докер:
+```
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt-get update
+sudo apt-get install docker-ce docker-compose
+```
+
+Создал директории и docker-compose.yml:
+```
+sudo mkdir -p /srv/gitlab/config /srv/gitlab/data /srv/gitlab/logs
+cd /srv/gitlab/
+sudo touch docker-compose.yml
+```
+
+Содержимое docker-compose.yml:
+```
+web:
+  image: 'gitlab/gitlab-ce:latest'
+  restart: always
+  hostname: 'gitlab.example.com'
+  environment:
+    GITLAB_OMNIBUS_CONFIG: |
+      external_url 'http://35.195.1.87'
+  ports:
+    - '80:80'
+    - '443:443'
+    - '2222:22'
+  volumes:
+    - '/srv/gitlab/config:/etc/gitlab'
+    - '/srv/gitlab/logs:/var/log/gitlab'
+    - '/srv/gitlab/data:/var/opt/gitlab'
+```
+
+Запустил docker-compose:
+```
+sudo docker-compose up -d 
+```
+
+Спустя минут 5 стал доступен интерфейс gitlab по адресу http://35.195.1.87
+
+Ввел новый пароль для root и авторизовался.
+
+Выключил регистрацию новых пользователей:
+```
+Admin Area -> Settings -> Sign-up restrictions -> Sign-up enabled
+```
+
+Создал новую группу проектов:
+```
+Groups -> New group
+```
+
+Создал проект:
+```
+New project
+```
+
+Запушил локальную ветку:
+```
+git checkout -b gitlab-ci-1
+git remote add gitlab http://35.195.1.87/homework/example.git 
+git push gitlab gitlab-ci-1
+```
+
+Добавил .gitlab-ci.yml:
+```
+stages:
+  - build
+  - test
+  - deploy
+
+build_job:
+  stage: build
+  script:
+    - echo 'Building'
+
+test_unit_job:
+  stage: test
+  script:
+    - echo 'Testing 1'
+
+test_integration_job:
+  stage: test
+  script:
+    - echo 'Testing 2'
+
+deploy_job:
+  stage: deploy
+  script:
+    - echo 'Deploy'
+```
+
+```
+git add .gitlab-ci.yml
+git commit -m 'add pipeline definition'
+git push gitlab gitlab-ci-1 
+```
+
+Скопировал токен для регистрации раннера:
+```
+Settings -> CI/CD -> Runners -> Set up a specific Runner manually
+```
+
+На сервере с gitlab-ci запустил раннер:
+```
+sudo docker run -d --name gitlab-runner --restart always \
+    -v /srv/gitlab-runner/config:/etc/gitlab-runner \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    gitlab/gitlab-runner:latest
+```
+
+Зарегистрировал раннер:
+```
+sudo docker exec -it gitlab-runner gitlab-runner register --run-untagged --locked=false
+
+Please enter the gitlab-ci coordinator URL (e.g. https://gitlab.com/):
+http://35.195.1.87
+Please enter the gitlab-ci token for this runner:
+<TOKEN>
+Please enter the gitlab-ci description for this runner:
+[f538b5f4f686]: my-runner
+Please enter the gitlab-ci tags for this runner (comma separated):
+linux,xenial,ubuntu,docker
+Registering runner... succeeded                     runner=ik_vvyva
+Please enter the executor: docker-ssh+machine, kubernetes, custom, parallels, shell, ssh, virtualbox, docker+machine, docker, docker-ssh:
+docker
+Please enter the default Docker image (e.g. ruby:2.6):
+alpine:latest
+Runner registered successfully. Feel free to start it, but if it's running already the config should be automatically reloaded!
+```
+
+После добавления раннера, запустился ранее созданный пайплайн.
+
+Добавил исходный код reddit в репозиторий:
+```
+git clone https://github.com/express42/reddit.git && rm -rf ./reddit/.git 
+git add reddit/
+git commit -m 'Add reddit app'
+git push gitlab gitlab-ci-1
+```
+
+Изменил описание пайплайна в .gitlab-ci.yml
+```
+image: ruby:2.4.2
+
+stages:
+...
+
+variables:
+ DATABASE_URL: 'mongodb://mongo/user_posts'
+ 
+before_script:
+ - cd reddit
+ - bundle install
+
+...
+test_unit_job:
+ stage: test
+ services:
+   - mongo:latest
+ script:
+   - ruby simpletest.rb
+... 
+``` 
+
+Добавил файл reddit/simpletest.rb
+```
+require_relative './app'
+require 'test/unit'
+require 'rack/test'
+
+set :environment, :test
+
+class MyAppTest < Test::Unit::TestCase
+  include Rack::Test::Methods
+
+  def app
+    Sinatra::Application
+  end
+
+  def test_get_request
+    get '/'
+    assert last_response.ok?
+  end
+end
+```
+
+Добавил библиотеку для тестирования в Gemfile
+```
+gem 'rack-test'
+```
+
+Запушил изменения
+
+### Окружения
+
+Изменим пайплайн таким образом, чтобы job deploy
+стал определением окружения dev, на которое условно
+будет выкатываться каждое изменение в коде проекта.
+
+Переименовал stage deploy в review
+
+Поправил джобу deploy_job
+```
+...
+deploy_dev_job:
+  stage: review
+  script:
+    - echo 'Deploy'
+  environment:
+    name: dev
+    url: http://dev.example.com
+
+```
+
+Добавил stage и production которые будут запускаться по кнопке (`when manual`):
+
+```
+stages:
+  ...
+  - stage
+  - production
+  
+staging:
+  stage: stage
+  when: manual
+  script:
+    - echo 'Deploy'
+  environment:
+    name: stage
+    url: http://beta.example.com
+
+production:
+  stage: production
+  when: manual
+  script:
+    - echo 'Deploy'
+  environment:
+    name: production
+    url: http://example.com
+```
+
+Запушил изменения
+
+Добавил ограничение для stage и production - должен стоять semver тег:
+```
+staging:
+  stage: stage
+  when: manual
+  only:
+    - /^\d+\.\d+\.\d+/
+  script:
+    - echo 'Deploy'
+  environment:
+    name: stage
+    url: http://beta.example.com
+
+production:
+  stage: production
+  when: manual
+  only:
+    - /^\d+\.\d+\.\d+/
+  script:
+    - echo 'Deploy'
+  environment:
+    name: production
+    url: http://example.com
+```
+
+Теперь коммит без тега запустит пайплайн без джоб stage и production.
+А добавление тега запустит полный пайплайн
+
+### Динамические окружения
+
+Gitlab CI позволяет определить динамические окружения, это мощная функциональность
+позволяет иметь выделенный стенд для, например, каждой feature-ветки в git.
+
+Определяются динамические окружения с помощью переменных, доступных в .gitlab-ci.yml
+
+Добавил джобу, которая определяет динамическое окружение для каждой ветки в
+репозитории, кроме ветки master:
+```
+branch review:
+  stage: review
+  script: echo "Deploy to $CI_ENVIRONMENT_SLUG"
+  environment:
+   name: branch/$CI_COMMIT_REF_NAME
+   url: http://$CI_ENVIRONMENT_SLUG.example.com
+  only:
+    - branches
+  except:
+    - master
+```
+
+Запуил изменения
+
+### Задания со *
+
+Добавил скрипт gitlab-ci/setup-runner.sh для создания раннера:
+```
+docker run -d --name gitlab-runner --restart always \
+    -v /srv/gitlab-runner/config:/etc/gitlab-runner \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    gitlab/gitlab-runner:latest
+
+docker exec -it gitlab-runner gitlab-runner register \
+    --non-interactive \
+    --url "$GITLAB_URL" \
+    --registration-token "$GITLAB_REGISTRATION_TOKEN" \
+    --executor "docker" \
+    --docker-image alpine:latest \
+    --description "docker-runner" \
+    --tag-list "docker,alpine" \
+    --run-untagged="true" \
+    --locked="false" \
+    --access-level="not_protected"
+```
+
+Добавил оповещения в slack.
+https://app.slack.com/client/T6HR0TUP3/CN18S9CF5
+
+### Полезные ссылки
+* https://docs.gitlab.com/runner/install/docker.html
+* https://docs.gitlab.com/runner/register/index.html#docker
+* https://docs.gitlab.com/ee/user/project/integrations/slack.html
