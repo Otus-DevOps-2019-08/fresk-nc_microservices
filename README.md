@@ -1200,3 +1200,254 @@ https://app.slack.com/client/T6HR0TUP3/CN18S9CF5
 * https://docs.gitlab.com/runner/install/docker.html
 * https://docs.gitlab.com/runner/register/index.html#docker
 * https://docs.gitlab.com/ee/user/project/integrations/slack.html
+
+## Homework 16. Введение в мониторинг. Системы мониторинга.
+
+Создал правило фаервола для Prometheus и Puma:
+
+```
+gcloud compute firewall-rules create prometheus-default --allow tcp:9090
+gcloud compute firewall-rules create puma-default --allow tcp:9292
+```
+
+Создал докер хост в GCE и настроил локальное окружение на работу с ним:
+```
+export GOOGLE_PROJECT=docker-258014
+
+docker-machine create --driver google \
+    --google-machine-image https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-1604-lts \
+    --google-machine-type n1-standard-1 \
+    --google-zone europe-west1-b \
+    docker-host
+    
+eval $(docker-machine env docker-host)
+```
+
+Запустил контейнер с прометеусом:
+```
+docker run --rm -p 9090:9090 -d --name prometheus prom/prometheus:v2.1.0
+```
+
+Открыл веб-интерфейс по адресу `http://35.240.35.125:9090/graph`
+
+> IP адрес можно узнать с помощью команды `docker-machine ip docker-host`
+
+Остановил контейнер:
+```
+docker stop prometheus
+```
+
+Унес docker-monolith и docker-compose в папку docker. Создал папку monitoring.
+В папке monitoring создал prometheus. В ней создал Dockerfile:
+```
+FROM prom/prometheus:v2.1.0
+ADD prometheus.yml /etc/prometheus/
+```
+
+Создал файл `prometheus.yml`:
+```
+global:
+  scrape_interval: '5s'
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+        - 'localhost:9090'
+
+  - job_name: 'ui'
+    static_configs:
+      - targets:
+        - 'ui:9292'
+
+  - job_name: 'comment'
+    static_configs:
+      - targets:
+        - 'comment:9292'
+```
+
+Собрал образ:
+```
+cd monitoring/prometheus
+export USER_NAME=fresk
+docker build -t $USER_NAME/prometheus .
+```
+
+Выполнил сборку образов приложения:
+```
+cd ../../src/ui
+bash docker_build.sh
+
+cd ../post-py
+bash docker_build.sh
+
+cd ../comment
+bash docker_build.sh
+```
+
+> Можно было проще - `for i in ui post-py comment; do cd src/$i; bash docker_build.sh; cd -; done`
+
+Добавил прометеус в docker-compose:
+```
+services:
+...
+  prometheus:
+    image: ${USERNAME}/prometheus
+    ports:
+      - '9090:9090'
+    volumes:
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention=1d'
+
+volumes:
+  prometheus_data:
+```
+
+Удалил `build` директивы из `docker_compose.yml`
+
+Добавил всем сервисам сеть:
+```
+networks:
+  - prometheus_net
+```
+
+В `.env` поправил версии образов на `latest`.
+
+Запустил docker-compose:
+```
+cd docker
+docker-compose up -d
+```
+
+### Мониторинг состояния микросервисов
+
+#### Healthchecks
+
+Healthcheck-и представляют собой проверки того, что
+наш сервис здоров и работает в ожидаемом режиме.
+
+Если сервис жив, то статус равен 1, иначе 0.
+
+Вбил в интерфейсе прометеуса `ui_health`, нажал `execute`, получил:
+```
+ui_health{branch="monitoring-1",commit_hash="8376844",instance="ui:9292",job="ui",version="0.0.1"} 1
+```
+
+Остановил post `docker-compose stop post`
+
+Опять выполнил `ui_health`, на этот раз получил:
+```
+ui_health{branch="monitoring-1",commit_hash="8376844",instance="ui:9292",job="ui",version="0.0.1"} 0
+```
+
+#### Поиск проблемы
+
+Помимо статуса сервиса, мы также собираем статусы сервисов, от
+которых он зависит. Названия метрик, значения которых соответствует
+данным статусам, имеет формат ui_health_<service-name>. 
+
+Наберем в строке выражений ui_health_ и Prometheus нам предложит
+дополнить названия метрик.
+
+Проверил ui_health_comment_availability, увидел, что статус не менялся.
+Проверил ui_health_post_availability - статус изменился на 0.
+
+Чиним проблему `docker-compose start post` :)
+
+### Сбор метрик хоста
+
+#### Exporters
+
+Экспортер похож на вспомогательного агента для
+сбора метрик.
+
+В ситуациях, когда мы не можем реализовать
+отдачу метрик Prometheus в коде приложения, мы
+можем использовать экспортер, который будет
+транслировать метрики приложения или системы в
+формате доступном для чтения Prometheus.
+
+Примеры: PostgreSQL, RabbitMQ, Nginx, Node exporter, cAdvisor
+
+#### Node exporter 
+
+Воспользуемся Node экспортер для сбора
+информации о работе Docker хоста (виртуалки, где у
+нас запущены контейнеры) и предоставлению этой
+информации в Prometheus.
+
+Node экспортер будем запускать также в контейнере. Определил еще один
+сервис в `docker/docker-compose.yml` файле.
+
+```
+node-exporter:
+  image: prom/node-exporter:v0.15.2
+  networks:
+    - prometheus_net
+  user: root
+  volumes:
+    - /proc:/host/proc:ro
+    - /sys:/host/sys:ro
+    - /:/rootfs:ro
+  command:
+    - '--path.procfs=/host/proc'
+    - '--path.sysfs=/host/sys'
+    - '--collector.filesystem.ignored-mount-points="^/(sys|proc|dev|host|etc)($$|/)"'
+```
+
+Добавил в конфиг прометеуса:
+```
+- job_name: 'node'
+  static_configs:
+    - targets:
+      - 'node-exporter:9100'
+```
+
+Собрал новый образ прометеуса:
+```
+cd monitoring/prometheus
+docker build -t $USER_NAME/prometheus .
+```
+
+Пересоздал сервисы:
+```
+cd ../../docker
+docker-compose down
+docker-compose up -d
+```
+
+В списке endpoint-ов(Status -> Targets) прометеуса появился еще один endpoint.
+
+Получил информацию об использовании ЦПУ - `node_load1`
+
+Проверил нагрузку:
+- зашел на машинку `docker-machine ssh docker-host`
+- увеличил нагрузку `yes > /dev/null`
+- мониторинг отобразил выросшую нагрузку
+
+### Завершение работы
+
+Запушил образы на docker-hub:
+
+```
+docker login
+Login Succeeded
+
+docker push $USER_NAME/ui
+docker push $USER_NAME/comment
+docker push $USER_NAME/post
+docker push $USER_NAME/prometheus 
+```
+
+- https://hub.docker.com/repository/docker/fresk/prometheus
+- https://hub.docker.com/repository/docker/fresk/post
+- https://hub.docker.com/repository/docker/fresk/ui
+- https://hub.docker.com/repository/docker/fresk/otus-reddit
+
+Удалил докер-хост:
+```
+docker-machine rm docker-host
+```
