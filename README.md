@@ -1451,3 +1451,331 @@ docker push $USER_NAME/prometheus
 ```
 docker-machine rm docker-host
 ```
+
+## Homework 17. Мониторинг приложения и инфраструктуры
+
+### Подготовка окружения
+
+```
+export GOOGLE_PROJECT=docker-258014
+
+docker-machine create --driver google \
+ --google-machine-image https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-1604-lts \
+ --google-machine-type n1-standard-1 \
+ --google-zone europe-west1-b \
+ docker-host
+
+eval $(docker-machine env docker-host)
+```
+
+В docker-compose.yml описано приложение и прометеус, такое смешивание 
+сущностей не очень хорошо.
+Вынес прометеус в docker-compose-monitoring.yml
+
+### [cAdvisor](https://github.com/google/cadvisor)
+
+cAdvisor собирает информацию о ресурсах потребляемых
+контейнерами и характеристиках их работы.
+
+Добавил cAdvisor в docker-compose-monitoring.yml:
+```
+cadvisor:
+  image: google/cadvisor:v0.29.0
+  networks:
+    - prometheus_net
+  volumes:
+    - '/:/rootfs:ro'
+    - '/var/run:/var/run:rw'
+    - '/sys:/sys:ro'
+    - '/var/lib/docker/:/var/lib/docker:ro'
+  ports:
+    - '8080:8080'
+```
+
+Добавил cAdvisor в prometheus.yml:
+```
+- job_name: 'cadvisor'
+  static_configs:
+    - targets:
+      - 'cadvisor:8080'
+```
+
+Пересобрал образ prometheus:
+```
+export USER_NAME=fresk
+cd monitoring/prometheus
+docker build -t $USER_NAME/prometheus .
+```
+
+Запустил сервисы:
+```
+cd ../../docker
+docker-compose up -d
+docker-compose -f docker-compose-monitoring.yml up -d
+```
+
+Добавил firewall правило для cadvisor:
+```
+gcloud compute firewall-rules create cadvisor-default --allow tcp:8080
+```
+
+Узнал ip виртуалки:
+```
+docker-machine ip docker-host
+35.233.91.236
+```
+
+Открыл интерфейс cAdvisor по адресу http://35.233.91.236:8080
+
+Нажал ссылку Docker Containers (внизу слева) для просмотра
+информации по контейнерам.
+
+По пути /metrics все собираемые метрики публикуются для
+сбора Prometheus. Имена метрик контейнеров начинаются со слова
+container.
+
+### Grafana
+
+Добавил grafana в docker-compose-monitoring.yml:
+```
+services:
+
+  grafana:
+    image: grafana/grafana:5.0.0
+    networks:
+      - prometheus_net
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=secret
+    depends_on:
+      - prometheus
+    ports:
+      - 3000:3000
+
+volumes:
+  grafana_data:
+```
+
+Запустил новый сервис:
+```
+docker-compose -f docker-compose-monitoring.yml up -d grafana
+```
+
+Добавил firewall правило для grafana:
+```
+gcloud compute firewall-rules create grafana-default --allow tcp:3000
+```
+
+Открыл интерфейс grafana по адресу http://35.233.91.236:3000
+
+Ввел логин и пароль из переменных окружение.
+
+Нажал "Add data source", затем заполнил форму и сохранил:
+```
+Name: Prometheus Server
+Type: Prometheus
+URL: http://prometheus:9090
+Access: Proxy
+```
+
+Перешел на сайт [grafana](https://grafana.com/grafana/dashboards), чтобы скачать
+комьюнити дашборд. Нашел дашборд "Docker and system monitoring".
+Нажал "Download JSON".
+
+Перенес скаченный JSON в monitoring/grafana/dashboards.
+Переименовал json в DockerMonitoring.json
+
+Снова зашел в интерфейс grafana http://35.233.91.236:3000,
+нажал "Create -> Import". Импортировал http://35.233.91.236:3000
+В качестве источника данных выбрал Prometheus Server.
+
+Добавил в prometheus.yml:
+```
+- job_name: 'post'
+  static_configs:
+    - targets:
+      - 'post:5000'
+```
+
+Пересобрал образ Prometheus:
+```
+cd ../monitoring/prometheus
+docker build -t $USER_NAME/prometheus .
+```
+
+Перезапустил инфраструктуру мониторинга:
+```
+docker-compose -f docker-compose-monitoring.yml down
+docker-compose -f docker-compose-monitoring.yml up -d
+```
+
+Создал несколько постов в приложении.
+
+Открыл интерфейс grafana http://35.233.91.236:3000
+
+Нажал "Create -> Dashboard -> Graph".
+Создался пустой график. Нажал на его имя и "Edit".
+
+На вкладке "Metrics" ввел в поле имя метрики `ui_request_count`.
+На вкладке "General" ввел имя и описание графика.
+Сохранил дашборд.
+
+Добавил график ошибок - нажал "Add panel -> Graph".
+На вкладке "Metrics" ввел в поле имя метрики `rate(ui_request_count{http_status=~"^[45].*"}[1m])`.
+На вкладке "General" ввел имя и описание графика.
+Сохранил дашборд.
+
+> Использовал функцию `rate()`, чтобы посмотреть не просто значение
+счетчика за весь период наблюдения, но и скорость увеличения 
+данной величины за промежуток времени.
+
+Видно, что первый график показывает просто счетчик запросов.
+Переделал на `rate()` - `rate(ui_request_count[1m])`.
+
+Добавил график 95-й процентиль для времени ответа - нажал "Add panel -> Graph".
+На вкладке "Metrics" ввел в поле имя метрики `histogram_quantile(0.95, sum(rate(ui_request_response_time_bucket[5m])) by (le))`.
+На вкладке "General" ввел имя и описание графика.
+Сохранил дашборд.
+
+Экспортировал дашборд в JSON файл,
+который положил в monitoring/grafana/dashboards/UI_Service_Monitoring.json
+
+Добавил еще один дашборд Business_Logic_Monitoring, с двумя графиками -
+rate созданных постов и комментариев за 1 час. 
+Экспортировал JSON в monitoring/grafana/dashboards/Business_Logic_Monitoring.json
+
+### Алертинг
+
+В Grafana есть alerting, но по функционалу он уступает Alertmanager в Prometheus.
+
+Alertmanager - дополнительный компонент для системы
+мониторинга Prometheus, который отвечает за первичную
+обработку алертов и дальнейшую отправку оповещений по
+заданному назначению.
+
+
+Создал директорию monitoring/alertmanager, в ней создал Dockerfile:
+```
+FROM prom/alertmanager:v0.14.0
+ADD config.yml /etc/alertmanager/
+```
+
+Добавил новый incoming webhook в слак https://my.slack.com/services/new/incoming-webhook в канал
+#george_besedin, скопировал url - https://hooks.slack.com/services/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 
+
+В monitoring/alertmanager создал config.yml:
+```
+global:
+  slack_api_url: 'https://hooks.slack.com/services/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'
+
+route:
+  receiver: 'slack-notifications'
+
+receivers:
+- name: 'slack-notifications'
+  slack_configs:
+  - channel: '#george_besedin'
+```
+
+Собрал образ с Alertmanager:
+```
+cd ../monitoring/alertmanager
+docker build -t $USER_NAME/alertmanager .
+```
+
+Добавил новый сервис в docker-compose-monitoring.yml:
+```
+alertmanager:
+  image: ${USER_NAME}/alertmanager
+  networks:
+    - prometheus_net
+  command:
+    - '--config.file=/etc/alertmanager/config.yml'
+  ports:
+    - '9093:9093'
+```
+
+Создал alerts.yml в monitoring/prometheus:
+```
+groups:
+  - name: alert.rules
+    rules:
+    - alert: InstanceDown
+      expr: up == 0
+      for: 1m
+      labels:
+        severity: page
+      annotations:
+        description: '{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute'
+        summary: 'Instance {{ $labels.instance }} down'
+```
+
+Создал простой алерт, который
+будет срабатывать в ситуации, когда одна из наблюдаемых систем
+(endpoint) недоступна для сбора метрик (в этом случае метрика up с
+лейблом instance равным имени данного эндпоинта будет равна
+нулю). 
+
+Добавил операцию копирования данного файла в Dockerfile
+monitoring/prometheus/Dockerfile:
+```
+ADD alerts.yml /etc/prometheus/
+```
+
+Добавил информацию о правилах в конфиг prometheus.yml:
+```
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+  - scheme: http
+    static_configs:
+    - targets:
+      - "alertmanager:9093"
+```
+
+Пересобрал образ prometheus:
+```
+cd ../prometheus
+docker build -t $USER_NAME/prometheus .
+```
+
+Перезапустил инфраструктуру мониторинга:
+```
+cd ../../docker
+docker-compose -f docker-compose-monitoring.yml down
+docker-compose -f docker-compose-monitoring.yml up -d
+```
+
+Алерты можно посмотреть в веб-интерфейсе Prometheus во вкладке Alerts.
+
+#### Проверка алерта
+
+Остановил один из сервисов:
+```
+docker-compose stop post
+```
+
+В слак пришло сообщение.
+
+### Завершение работы
+
+Запушил образы в докер-хаб:
+
+```
+docker login
+
+docker push $USER_NAME/ui
+docker push $USER_NAME/comment
+docker push $USER_NAME/post
+docker push $USER_NAME/prometheus
+docker push $USER_NAME/alertmanager
+```
+
+Удалил виртуалку
+```
+docker-machine rm docker-host
+```
