@@ -1779,3 +1779,341 @@ docker push $USER_NAME/alertmanager
 ```
 docker-machine rm docker-host
 ```
+
+## Homework 18. Логирование и распределенная трассировка
+
+### Подготовка окружения
+
+```
+export GOOGLE_PROJECT=docker-258014
+
+docker-machine create --driver google \
+    --google-machine-image https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-1604-lts \
+    --google-machine-type n1-standard-1 \
+    --google-open-port 5601/tcp \
+    --google-open-port 9292/tcp \
+    --google-open-port 9411/tcp \
+    logging
+
+eval $(docker-machine env logging)
+```
+
+Обновил код приложения, скачал из репозитория https://github.com/express42/reddit/tree/logging
+
+Собрал новые образы `for i in ui post-py comment; do cd src/$i; bash docker_build.sh; cd -; done`
+
+### Логирование Docker контейнеров
+
+Рассмотрим пример системы централизованного логирования на
+примере Elastic стека (ранее известного как ELK): который включает
+в себя 3 осовных компонента:
+- ElasticSearch (TSDB и поисковый движок для хранения данных)
+- Logstash (для агрегации и трансформации данных)
+- Kibana (для визуализации)
+
+Однако для агрегации логов вместо Logstash мы будем
+использовать Fluentd, таким образом получая еще одно
+популярное сочетание этих инструментов, получившее название EFK
+
+Создал docker-compose-logging.yml
+```
+version: '3.3'
+services:
+  fluentd:
+    image: ${USERNAME}/fluentd
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+
+  elasticsearch:
+    image: elasticsearch:7.5.0
+    expose:
+      - 9200
+    ports:
+      - "9200:9200"
+
+  kibana:
+    image: kibana:7.5.0
+    ports:
+      - "5601:5601"
+```
+
+Fluentd инструмент, который может использоваться для
+отправки, агрегации и преобразования лог-сообщений.
+Мы будем использовать Fluentd для агрегации (сбора в одной месте) и
+парсинга логов сервисов нашего приложения.
+
+Создал папку logging/fluend и в ней Dockerfile
+```
+FROM fluent/fluentd:v0.12
+RUN gem install fluent-plugin-elasticsearch --no-rdoc --no-ri --version 1.9.5
+RUN gem install fluent-plugin-grok-parser --no-rdoc --no-ri --version 1.0.0
+ADD fluent.conf /fluentd/etc
+```
+
+Тамже создал fluent.conf
+```
+<source>
+  @type forward
+  port 24224
+  bind 0.0.0.0
+</source>
+
+<match *.**>
+  @type copy
+  <store>
+    @type elasticsearch
+    host elasticsearch
+    port 9200
+    logstash_format true
+    logstash_prefix fluentd
+    logstash_dateformat %Y%m%d
+    include_tag_key true
+    type_name access_log
+    tag_key @log_name
+    flush_interval 1s
+  </store>
+  <store>
+    @type stdout
+  </store>
+</match>
+```
+
+Собрал образ с fluentd
+```
+cd logging/fluentd
+docker build -t $USER_NAME/fluentd .
+```
+
+#### Структурированные логи
+
+Логи должны иметь заданную (единую) структуру и содержать
+необходимую для нормальной эксплуатации данного сервиса
+информацию о его работе.
+
+Лог-сообщения также должны иметь понятный для выбранной
+системы логирования формат, чтобы избежать ненужной траты
+ресурсов на преобразование данных в нужный вид.
+Структурированные логи рассмотрим на примере сервиса post.
+
+Поправил версии контейнеров на `logging` в .env файле.
+
+Запустил сервисы
+```
+docker-compose up -d
+```
+
+Вывел логи сервиса post:
+```
+docker-compose logs -f post
+
+Attaching to reddit_post_1
+post_1     | {"addr": "172.20.0.2", "event": "request", "level": "info", "method": "GET", "path": "/healthcheck?", "request_id": null, "response_status": 200, "service": "post", "timestamp": "2019-12-08 21:24:37"}
+```
+
+Создал новый пост, вижу в логах:
+```
+post_1     | {"event": "find_all_posts", "level": "info", "message": "Successfully retrieved all posts from the database", "params": {}, "request_id": "91b02815-491c-464a-a26a-0ba465573fa3", "service": "post", "timestamp": "2019-12-08 21:25:58"}
+post_1     | {"addr": "172.20.0.2", "event": "request", "level": "info", "method": "GET", "path": "/posts?", "request_id": "aa6dbf81-c1a6-4604-a781-afc3c8e14445", "response_status": 200, "service": "post", "timestamp": "2019-12-08 21:26:04"}
+post_1     | {"event": "post_create", "level": "info", "message": "Successfully created a new post", "params": {"link": "http://123.ru", "title": "123"}, "request_id": "249bcd66-494b-44bc-8b1e-ea0051bab813", "service": "post", "timestamp": "2019-12-08 21:26:04"}
+```
+
+Добавил драйвер для fluentd в docker-compose.yml
+```
+  post:
+    ...
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: localhost:24224
+        tag: service.post
+```
+
+Поднял инфраструктуру централизованной системы
+логирования и перезапустил сервисы приложения
+```
+docker-compose -f docker-compose-logging.yml up -d
+docker-compose down
+docker-compose up -d
+```
+
+Kibana - инструмент для визуализации и анализа логов от
+компании Elastic.
+
+Зашел в веб-интерфейс кибаны http://34.66.124.51:5601,
+увидел ошибку - `Kibana server is not ready yet`
+
+В логах elasticsearch ошибки:
+```
+docker-compose -f docker-compose-logging.yml logs -f elasticsearch
+
+...
+ERROR: [2] bootstrap checks failed
+elasticsearch_1  | [1]: max virtual memory areas vm.max_map_count [65530] is too low, increase to at least [262144]
+elasticsearch_1  | [2]: the default discovery settings are unsuitable for production use; at least one of [discovery.seed_hosts, discovery.seed_providers, cluster.initial_master_nodes] must be configured
+...
+```
+
+Решение первой проблемы - увеличил `max virtual memory areas` на докер-хосте:
+```
+docker-machine ssh logging
+sudo sysctl -w vm.max_map_count=262144
+exit
+```
+
+Решение второй проблемы - добавил переменную окружения в запуск `elasticsearch`:
+```
+elasticsearch:
+  ...
+  environment:
+    - discovery.type=single-node
+```
+
+В веб-интерфейсе нажал "Discover" и создал индекс:<br>
+Index pattern: fluentd-*<br>
+Time Filter field name: @timestamp<br>
+
+Добавил фильтр логов в fluent.conf
+```
+<filter service.post>
+  @type parser
+  format json
+  key_name log
+</filter>
+```
+
+Пересобрал образ и перезапустил fluentd
+```
+cd ../logging/fluentd
+docker build -t $USER_NAME/fluentd .
+cd ../../docker
+docker-compose -f docker-compose-logging.yml up -d fluentd
+```
+
+#### Неструктурированные логи
+
+Неструктурированные логи отличаются отсутствием четкой
+структуры данных. Также часто бывает, что формат лог-сообщений
+не подстроен под систему централизованного логирования, что
+существенно увеличивает затраты вычислительных и временных
+ресурсов на обработку данных и выделение нужной информации.
+
+На примере сервиса ui мы рассмотрим пример логов с
+неудобным форматом сообщений.
+
+Добавил в docker-compose.yml лог-драйвер для ui:
+```
+  ui:
+    ...
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: localhost:24224
+        tag: service.ui
+```
+
+Перезапустил приложение:
+```
+docker-compose stop ui
+docker-compose rm ui
+docker-compose up -d
+```
+
+В кибане неструктурированный лог выглядит так:
+```
+I, [2019-12-09T21:28:24.776558 #1]  INFO -- : service=ui | event=show_all_posts | request_id=5e685143-e71f-476c-ad2a-40fb6a876925 | message='Successfully showed the home page with posts' | params: "{}"
+```
+
+Добавил в fluent.conf парсинг такого лога с помощью регулярных выражений:
+```
+<filter service.ui>
+  @type parser
+  format /\[(?<time>[^\]]*)\]  (?<level>\S+) (?<user>\S+)[\W]*service=(?<service>\S+)[\W]*event=(?<event>\S+)[\W]*(?:path=(?<path>\S+)[\W]*)?request_id=(?<request_id>\S+)[\W]*(?:remote_addr=(?<remote_addr>\S+)[\W]*)?(?:method= (?<method>\S+)[\W]*)?(?:response_status=(?<response_status>\S+)[\W]*)?(?:message='(?<message>[^\']*)[\W]*)?/
+  key_name log
+</filter>
+```
+
+Пересобрал образ и перезапустил контейнер:
+```
+cd ../logging/fluentd
+docker build -t $USER_NAME/fluentd .
+cd ../../docker
+docker-compose -f docker-compose-logging.yml up -d
+```
+
+Созданные регулярки могут иметь ошибки, их сложно менять и
+невозможно читать. Для облегчения задачи парсинга вместо
+стандартных регулярок можно использовать grok-шаблоны. По-сути
+grok’и - это именованные шаблоны регулярных выражений (очень
+похоже на функции). Можно использовать готовый regexp, просто
+сославшись на него как на функцию docker/fluentd/fluent.conf
+```
+...
+<filter service.ui>
+  @type parser
+  key_name log
+  format grok
+  grok_pattern %{RUBY_LOGGER}
+</filter>
+
+<filter service.ui>
+  @type parser
+  format grok
+  grok_pattern service=%{WORD:service} \| event=%{WORD:event} \| request_id=%{GREEDYDATA:request_id} \| message='%{GREEDYDATA:message}'
+  key_name message
+  reserve_data true
+</filter>
+...
+```
+
+Это grok-шаблон, зашитый в плагин для fluentd. В развернутом
+виде он выглядит вот так:
+```
+%{RUBY_LOGGER} [(?<timestamp>(?>\d\d){1,2}-(?:0?[1-9]|1[0-2])-(?:(?:0[1-9])|(?:[12][0-9])|
+(?:3[01])|[1-9])[T ](?:2[0123]|[01]?[0-9]):?(?:[0-5][0-9])(?::?(?:(?:[0-5]?[0-9]|60)(?:
+[:.,][0-9]+)?))?(?:Z|[+-](?:2[0123]|[01]?[0-9])(?::?(?:[0-5][0-9])))?) #(?<pid>\b(?:[1-9]
+[0-9]*)\b)\] *(?<loglevel>(?:DEBUG|FATAL|ERROR|WARN|INFO)) -- +(?<progname>.*?): (?
+<message>.*)
+```
+
+### Распределенный трейсинг
+
+Добавил zipkin в docker-compose-logging.yml
+```
+zipkin:
+    image: openzipkin/zipkin
+    ports:
+      - "9411:9411"
+```
+
+Добавил для всех сервисов в docker-compose.yml:
+```
+environment:
+  - ZIPKIN_ENABLED=${ZIPKIN_ENABLED}
+```
+
+Добавил в .env
+```
+ZIPKIN_ENABLED=true
+```
+
+Добавил сети приложения в docker-compose-logging.yml
+```
+  zipkin:
+    ...
+    networks:
+      - front_net
+      - back_net
+...
+networks:
+  back_net:
+  front_net:
+```
+
+Пересоздал сервисы:
+```
+docker-compose -f docker-compose-logging.yml -f docker-compose.yml down
+docker-compose -f docker-compose-logging.yml -f docker-compose.yml up -d
+```
+
+Зашел в веб-интерфейс zipkin http://34.66.124.51:9411
