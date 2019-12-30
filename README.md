@@ -4283,4 +4283,539 @@ Starting to serve on 127.0.0.1:8001
 шаги из [официальной документации](https://kubernetes.io/docs/tasks/access-application-cluster/web-ui-dashboard/), 
 после чего получилось увидеть интерфейс дашборда. 
 
+## Homework 21. Kubernetes. Networks ,Storages
 
+Тип LoadBalancer позволяет нам использовать внешний
+облачный балансировщик нагрузки как единую точку
+входа в наши сервисы, а не полагаться на IPTables и не
+открывать наружу весь кластер.
+
+Обновил ui-service.yml
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  labels:
+    app: reddit
+    component: ui
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      nodePort: 32092
+      protocol: TCP
+      targetPort: 9292
+  selector:
+    app: reddit
+    component: ui
+```
+
+Применил
+```
+kubectl apply -f ui-service.yml -n dev
+```
+
+Балансировка с помощью Service типа LoadBalancing имеет
+ряд недостатков:
+- нельзя управлять с помощью http URI (L7-балансировка)
+- используются только облачные балансировщики (AWS,
+GCP)
+- нет гибких правил работы с трафиком
+
+Для более удобного управления входящим
+снаружи трафиком и решения недостатков
+LoadBalancer можно использовать другой объект
+Kubernetes - Ingress.
+
+Ingress – это набор правил внутри кластера Kubernetes,
+предназначенных для того, чтобы входящие подключения
+могли достичь сервисов (Services).
+Сами по себе Ingress’ы это просто правила. Для их
+применения нужен Ingress Controller.
+
+Ingress Controller - это скорее плагин (а значит и отдельный POD),
+который состоит из 2-х функциональных частей:
+- Приложение, которое отслеживает через k8s API новые
+  объекты Ingress и обновляет конфигурацию балансировщика
+- Балансировщик (Nginx, haproxy, traefik,…), который и
+  занимается управлением сетевым трафиком
+  
+Основные задачи, решаемые с помощью Ingress’ов: 
+- Организация единой точки входа в приложения снаружи
+- Обеспечение балансировки трафика
+- Терминация SSL 
+- Виртуальный хостинг на основе имен и т.д
+
+Создал ui-ingress.yml
+```
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: ui
+spec:
+  backend:
+    serviceName: ui
+    servicePort: 80
+```
+
+И применил
+```
+kubectl apply -f ui-ingress.yml -n dev
+```
+
+Посмотрим кластер
+```
+kubectl get ingress -n dev
+
+NAME   HOSTS   ADDRESS         PORTS   AGE
+ui     *       34.98.109.162   80      50m
+```
+
+Адрес сервиса - http://34.98.109.162:80
+
+В текущей схеме есть несколько недостатков:
+- у нас 2 балансировщика для 1 сервиса
+- Мы не умеем управлять трафиком на уровне HTTP
+
+Один балансировщик можно спокойно убрать. Обновил сервис для UI
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  labels:
+    app: reddit
+    component: ui
+spec:
+  type: NodePort
+  ports:
+    - port: 9292
+      protocol: TCP
+      targetPort: 9292
+  selector:
+    app: reddit
+    component: ui
+```
+
+Применил
+```
+kubectl apply -f ui-service.yml -n dev
+```
+
+Заставил работать Ingress Controller как классический веб
+```
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: ui
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /*
+            backend:
+              serviceName: ui
+              servicePort: 9292
+```
+
+Применил
+```
+kubectl apply -f ui-ingress.yml -n dev
+```
+
+Теперь защитим сервис с помощью TLS.
+
+Вспомнил ingress IP
+```
+kubectl get ingress -n dev
+
+NAME   HOSTS   ADDRESS         PORTS   AGE
+ui     *       34.98.109.162   80      63m
+``` 
+
+Подготовил сертификат используя IP как CN
+```
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout tls.key -out tls.crt -subj "/CN=34.98.109.162"
+```
+
+Загрузил сертификат в кластер
+```
+kubectl create secret tls ui-ingress --key tls.key --cert tls.crt -n dev
+```
+
+Проверил
+```
+kubectl describe secret ui-ingress -n dev
+
+Name:         ui-ingress
+Namespace:    dev
+Labels:       <none>
+Annotations:  <none>
+
+Type:  kubernetes.io/tls
+
+Data
+====
+tls.crt:  989 bytes
+tls.key:  1704 bytes
+```
+
+Настроил ingress на прием только HTTPS трафика
+```
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: ui
+  annotations:
+    kubernetes.io/ingress.allow-http: "false"
+spec:
+  tls:
+    - secretName: ui-ingress
+  rules:
+    - http:
+        paths:
+          - path: /*
+            backend:
+              serviceName: ui
+              servicePort: 9292
+```
+
+Применил
+```
+kubectl apply -f ui-ingress.yml -n dev
+```
+
+Иногда протокол HTTP может не удалиться у существующего
+Ingress правила, тогда нужно его вручную удалить и
+пересоздать
+
+```
+kubectl delete ingress ui -n dev
+kubectl apply -f ui-ingress.yml -n dev
+```
+
+### Дополнительное задание
+
+Задание:
+
+Опишите создаваемый объект Secret в виде Kubernetesманифеста.
+
+Решение:
+
+Создал tls-secret.yml
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ui-secret
+type: kubernetes.io/tls
+data:
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNyRENDQVpRQ0NRQ1AvSWVuMy8zempqQU5CZ2txaGtpRzl3MEJBUXNGQURBWU1SWXdGQVlEVlFRRERBMHoKTkM0NU9DNHhNRGt1TVRZeU1CNFhEVEU1TVRJeU56RTVNRGt3T1ZvWERUSXdNVEl5TmpFNU1Ea3dPVm93R0RFVwpNQlFHQTFVRUF3d05NelF1T1RndU1UQTVMakUyTWpDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVBBRENDCkFRb0NnZ0VCQUxtTmowc3JCNzJJWTFLV0ZibERFaEpPNGc1cjMvalcybmdnMzEybnpkd01rUFo1UHNpV0lPa08KTUFXaUdTRjd2NEM5R3Z5cmtiUEovZVczMzkyMHRQZ3RPSWRLT09NUXQxNXdpbEpZUDU2c0NuSlp2b1N2a2tRRApyR3V1c0Y3Z3p4YTZ4VDh0alQ5aUNvMWpDK2xDWWFYUVRSNG04WnRCWkMxSWZZdDk4SGtnbEpZam8vT0VLWmgyCk8wTkRWanBXUExJTE5qK1lCYngvM2h3K25QZ1hNU1JmcWhybXkzU0RyVHBUMytHSU9JZmg0OG0vVk5jYnJ3OGwKeHlycTc3eWtFK0p0MlN4dHd4THVQVWdhSWlFcHlLL1c2NWZCQ3YvaVAxTVpVcW81YTNmUXlFdmVJTVFxT0VWUApZY2lDYitGY0hVMWptcU9VTk5kVjhiMFIxOWRqMTNrQ0F3RUFBVEFOQmdrcWhraUc5dzBCQVFzRkFBT0NBUUVBCmladTBuMjJ0RzZod0VOWVJ3Vi9kMC9WVXcwNGM3N2hOQ0VITVRKZDJFQmFwaERRclVTNDNVeDREa21HOVRHYU8KWnpReWl0Wmx3R0hQaDVXVlFDZUMyc2xYeFhjRGdZYU4xNEFmejVpakkxSHV0K05pMU96bmdJb2g4aU1LYjVNaAovUEFVK1NhdEJIVU9sOWpRWFJpcy9Gak5BTWdvbGVaSVVNR244QXllWUdUWTViaHoyRGx0ZGJIV0VSR2JJQVRwCk5SbDh6SVBMUUNJN2Jzb0k0a1RPNE85ZDdmV0ptUnNiYm1nc2lEblBGLzRlcWRndmwxaFJreGprSE9GUVNzK24KVWMvVG00VEVrUVpGRCswMWl5QUpucW0ybnJ5d09OaUs2T1JKUEpUOEFsRjhvQUd1VDRIZGYvTjJUVFdiSHNZVQpmdEw3TnJWY0RXUGt3MnZQbkpPZGtBPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+  tls.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2UUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktjd2dnU2pBZ0VBQW9JQkFRQzVqWTlMS3dlOWlHTlMKbGhXNVF4SVNUdUlPYTkvNDF0cDRJTjlkcDgzY0RKRDJlVDdJbGlEcERqQUZvaGtoZTcrQXZScjhxNUd6eWYzbAp0OS9kdExUNExUaUhTampqRUxkZWNJcFNXRCtlckFweVdiNkVyNUpFQTZ4cnJyQmU0TThXdXNVL0xZMC9ZZ3FOCll3dnBRbUdsMEUwZUp2R2JRV1F0U0gyTGZmQjVJSlNXSTZQemhDbVlkanREUTFZNlZqeXlDelkvbUFXOGY5NGMKUHB6NEZ6RWtYNm9hNXN0MGc2MDZVOS9oaURpSDRlUEp2MVRYRzY4UEpjY3E2dSs4cEJQaWJka3NiY01TN2oxSQpHaUloS2NpdjF1dVh3UXIvNGo5VEdWS3FPV3QzME1oTDNpREVLamhGVDJISWdtL2hYQjFOWTVxamxEVFhWZkc5CkVkZlhZOWQ1QWdNQkFBRUNnZ0VCQUpsZmJIRktpU1JlQnhNdG9aazMya2t0ME9id3ZmbjJ4akNEbzMzTGhYcDkKSEpuT2tGbkcxajh0amY0cUJiSEtrdmw3MWtIQ0l6WkVJVXp2VnVqd1JLSGE1eDNVK1A2ZlE2S1pUWXhSQzQxQgpVWVZCcnh3SDc5T3VZYWZFaGw1MlhsYkFYT2dpNDl6ZlVpK2FEaTlwd2tNSDBhYTVzLzJMNkowUmpVeHU5Z1YzCndmUnVpYys3SGlyUkJCQnR5NmRnbFFkTCtVN20zYU9HQVZkSDhFanVUcXNzZk56ZTdKK1U0RjRyLzlqUEZVMlcKQ3RpckYvYmRXVEQ2WVFHVnpzOUlBamV2MS9weVlVckp5Z0NRdlMzSTZ2WmtEaWYrcWlhbFhmTVIyYnhaM1Z2RgpkVTNkS3lGMWI4VHozVS91bGphaUJuMUNONkVnUDByT21nSlJGVjBCUHpFQ2dZRUE3b1JQTDM3ek1MWHNRaDB3CmJIUDJZbmpQSVhkaUhxR3lhbzcvVncyanYxMVJKdWpNU2NKSGZnejdESFYycmh5ZjBnbEJoYm1uT3FWTGlIWGsKRnZPZkdKMEhSUXk1ODExdnMySnpzUmFSeFk5eGIxMHoycmd1ZFJ6R1FpeEdtNitRb3ROOW1JKzJsUENkMmNOawpZUmg5NDg2RXdLRERhR0Q2eEZZZE9KMXRGTlVDZ1lFQXh5ZG1sc05nM25mWUlQRS85RVByRTV2M01ORGk0ZXN1CnZkYnZVeEY2ZEdTei9xdEpvVFhGSFNjZDNmTzdVRXhZVzlsR0VNWnllWEN1N0lDZm5YZUZBNzI2WllSUk15aEsKM2paeXJtMCtjT2phczJsUEp4UFpRTVp1NTZhZ0NCZHc5cGswYmw3dkNvYVlQTnVFVXFhRkhwaGFjTXluY2pmNQo5dHVQRkt2Rm1oVUNnWUI0UkxNQkNneHFaWEZLTFJtN3RnVm94ZTM3dkF6MzBTVDc0anNTbEVnYk9GeXhOL1c2Cnc0SDFKMnAzYjh0MkkremFwZHdxSitFUkMwUTQvT2tVUWFmWmEyUzlCcHZGQVRwUHc3YitkcGp1ZTFRQmlZZWEKSkFFWkFIZGY2cDkzNVdFVEdYMWRMaW9zazkra2JJZnpCYnlFNEIvRVdjdnVsK2dhbENtTDRLV2VPUUtCZ0RkaQptOE05M3NpLzU1bHh2bWwrSWZnNEhjeXpxd1ZOVkpoekYrZXdLckFIK1k3UHNCQm5WY1EveHF5ZFJmQ1U2dFhRClhRMzVRb2pIYjc1U0h4RzUxWUl1MTVHMzlLVVhoWXE2OWJYUXA5YmF5MGV0OTlkVVM4MFo0bW9HQ3VkMUxYTkgKTkMrbHN6RG9NWnByS2llYUs5ZFFZNGFQUTlvZCt5Uk45MEsyYXFQcEFvR0FjQnRscHZhSnArVk9BeDJjSzlmKwpNeVRtejBLUHY1T0xRUm5rbzRvRG81azF5NUs0K080bmNhb0hZdW4zUWIxS2ZTUWRDL3d5U1hNNzQyZy91N0JXCmVBY3RlM04xbDY4WlR0bFk0a0ljYlVGaGNlRElKYytoZlNQWXhvdlltNlQvcW9tMGtUVXNENi9kT3ZxdWVhZzEKOVVIQzBqZEhkUUtDeGdKT2ZMc0tEK1U9Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0K
+
+```
+
+Как получил `tls.crt` и `tls.key`
+```
+cat tls.crt | base64
+cat tls.key | base64
+```
+
+Полезные ссылки
+- https://kubernetes.io/docs/concepts/configuration/secret/
+- https://kubernetes.io/docs/tasks/tls/managing-tls-in-a-cluster/
+
+### Network Policy
+
+Наша задача - ограничить трафик, поступающий на
+mongodb отовсюду, кроме сервисов post и comment
+
+Нашел имя кластера
+```
+gcloud beta container clusters list
+
+NAME                LOCATION       MASTER_VERSION  MASTER_IP      MACHINE_TYPE  NODE_VERSION    NUM_NODES  STATUS
+standard-cluster-1  us-central1-a  1.13.11-gke.14  34.69.186.126  g1-small      1.13.11-gke.14  2          RUNNING
+```
+
+Включил network-policy для GKE
+```
+gcloud beta container clusters update standard-cluster-1 --zone=us-central1-a --update-addons=NetworkPolicy=ENABLED
+gcloud beta container clusters update standard-cluster-1 --zone=us-central1-a  --enable-network-policy
+```
+
+Создал mongo-network-policy.yml
+```
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-db-traffic
+  labels:
+    app: reddit
+spec:
+  podSelector:
+    matchLabels:
+      app: reddit
+      component: mongo
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: reddit
+          component: comment
+    - podSelector:
+        matchLabels:
+          app: reddit
+          component: post
+```
+
+Пояснения
+
+Выбираем объекты политики (pod’ы с mongodb)
+```
+podSelector:
+ matchLabels:
+   app: reddit
+   component: mongo
+```
+
+Запрещаем все входящие подключения. Исходящие разрешены
+```
+policyTypes:
+  - Ingress
+```
+
+Разрешаем все входящие подключения от
+POD-ов с label-ами comment и post
+```
+ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: reddit
+          component: comment
+    - podSelector:
+        matchLabels:
+          app: reddit
+          component: post
+```
+
+Применил
+```
+kubectl apply -f mongo-network-policy.yml -n dev
+```
+
+### Хранилище для базы
+
+Основной Stateful сервис в нашем приложении - это база данных MongoDB.
+
+В текущий момент она запускается в виде Deployment и
+хранит данные в стаднартный Docker Volume-ах. Это
+имеет несколько проблем:
+- при удалении POD-а удаляется и Volume
+- потеря Nod’ы с mongo грозит потерей данных
+- запуск базы на другой ноде запускает новый экземпляр данных
+
+Сейчас используется тип Volume emptyDir. При создании пода с
+таким типом просто создается пустой docker volume.
+При остановке POD’a содержимое emtpyDir удалится навсегда. Хотя
+в общем случае падение POD’a не вызывает удаления Volume’a.
+
+Вместо того, чтобы хранить данные локально на ноде, имеет смысл
+подключить удаленное хранилище. В нашем случае можем
+использовать Volume gcePersistentDisk, который будет складывать
+данные в хранилище GCE.
+
+Создал новый диск
+```
+gcloud compute disks create --size=25GB --zone=us-central1-a reddit-mongo-disk
+```
+
+Добавил новый Volume в mongo-deployment.yml
+```
+spec:
+  containers:
+    - image: mongo:3.2
+      name: mongo
+      volumeMounts:
+        - name: mongo-gce-pd-storage
+          mountPath: /data/db
+  volumes:
+    - name: mongo-persistent-storage
+      emptyDir: {}
+      volumes:
+    - name: mongo-gce-pd-storage
+      gcePersistentDisk:
+        pdName: reddit-mongo-disk
+        fsType: ext4
+``` 
+
+Применил
+```
+kubectl apply -f mongo-deployment.yml -n dev
+```
+
+> Создание нового Pod'а может занимать до 10 минут
+
+#### PersistentVolume
+
+Используемый механизм Volume-ов можно сделать удобнее.
+Мы можем использовать не целый выделенный диск для
+каждого пода, а целый ресурс хранилища, общий для всего
+кластера.
+Тогда при запуске Stateful-задач в кластере, мы сможем
+запросить хранилище в виде такого же ресурса, как CPU или
+оперативная память.
+
+Для этого будем использовать механизм PersistentVolume.
+
+Создал mongo-volume.yml
+```
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: reddit-mongo-disk
+spec:
+  capacity:
+    storage: 25Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  gcePersistentDisk:
+    fsType: "ext4" 
+    pdName: "reddit-mongo-disk"
+```
+
+Применил
+```
+kubectl apply -f mongo-volume.yml -n dev
+```
+
+#### PersistentVolumeClaim
+
+Мы создали ресурс дискового хранилища, распространенный
+на весь кластер, в виде PersistentVolume.
+
+Чтобы выделить приложению часть такого ресурса - нужно
+создать запрос на выдачу - PersistentVolumeClaim.
+Claim - это именно запрос, а не само хранилище.
+
+Создал mongo-claim.yml
+```
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: mongo-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 15Gi
+```
+
+Применил
+```
+kubectl apply -f mongo-claim.yml -n dev
+```
+
+Подключил PVC к Pod'ам (mongo-deployment.yml)
+```
+spec:
+  containers:
+    - image: mongo:3.2
+      name: mongo
+      volumeMounts:
+        - name: mongo-gce-pd-storage
+          mountPath: /data/db
+  volumes:
+    - name: mongo-gce-pd-storage
+      persistentVolumeClaim:
+        claimName: mongo-pvc
+```
+
+Применил
+```
+kubectl apply -f mongo-deployment.yml -n dev
+```
+
+Создав PersistentVolume мы отделили объект "хранилища" от
+наших Service'ов и Pod'ов. Теперь мы можем его при
+необходимости переиспользовать.
+
+Но нам гораздо интереснее создавать хранилища при
+необходимости и в автоматическом режиме. В этом нам
+помогут StorageClass’ы. Они описывают где (какой
+провайдер) и какие хранилища создаются.
+
+В нашем случае создадим StorageClass Fast так, чтобы
+монтировались SSD-диски для работы нашего хранилища. 
+
+Создал storage-fast.yml
+```
+kind: StorageClass
+apiVersion: storage.k8s.io/v1beta1
+metadata:
+  name: fast
+provisioner: kubernetes.io/gce-pd
+parameters:
+  type: pd-ssd
+```
+
+Применил
+```
+kubectl apply -f storage-fast.yml -n dev
+```
+
+Создал mongo-claim-dynamic.yml
+```
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: mongo-pvc-dynamic
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+Применил
+```
+kubectl apply -f mongo-claim-dynamic.yml -n dev
+```
+
+Подключил PVC к Pod'ам(mongo-deployment.yml)
+```
+spec:
+  containers:
+    - image: mongo:3.2
+      name: mongo
+      volumeMounts:
+        - name: mongo-gce-pd-storage
+          mountPath: /data/db
+  volumes:
+    - name: mongo-gce-pd-storage
+      persistentVolumeClaim:
+        claimName: mongo-pvc-dynamic
+``` 
+
+Применил
+```
+kubectl apply -f mongo-deployment.yml -n dev
+```
+
+Список PersistentVolume'ов
+```
+kubectl get persistentvolume -n dev
+
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM                   STORAGECLASS   REASON   AGE
+pvc-5e770c4a-28e5-11ea-a144-42010a800034   10Gi       RWO            Delete           Bound       dev/mongo-pvc-dynamic   fast                    108s
+pvc-8000b252-28e4-11ea-a144-42010a800034   15Gi       RWO            Delete           Bound       dev/mongo-pvc           standard                8m1s
+reddit-mongo-disk                          25Gi       RWO            Retain           Available                                                   10m
+```
